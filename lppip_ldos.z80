@@ -1,0 +1,221 @@
+; LPPIP - LS-DOS File Copy Utility
+; For TRS-80 Model I, III, 4 running LDOS / LS-DOS / TRSDOS
+;
+; Based on PPIP v1.8 (D. Jewett III, 1985-1988)
+; Ported to C as CPPIP/FPPIP, then to native LS-DOS Z80 assembly
+; By Intangybles 2026
+;
+; Assemble: zmac --oo cmd lppip_ldos.z80  (output: zout/lppip.cmd)
+
+CR          EQU     0DH             ; carriage return -- LS-DOS string terminator
+SPC         EQU     20H             ; ASCII space
+
+; FreHD I/O port definitions
+DATA2       EQU     0C2H        ; data transfer
+SIZE2       EQU     0C3H        ; block size / response length
+COMMAND2    EQU     0C4H        ; command byte (OUT only)
+ERROR2      EQU     0C5H        ; FatFS error code (IN only)
+STATUS      EQU     0CFH        ; busy/error/DRQ flags (IN only)
+
+; TRSDOS error codes
+FERR_EOF    EQU     28          ; attempt to read past EOF (normal end of file)
+FERR_RNG    EQU     29          ; NRN > ERN (also normal EOF for sector reads)
+
+; FreHD command protocol - self described
+SD_CMD_GETVER    EQU 00H
+SD_CMD_OPENFILE  EQU 03H
+SD_CMD_READFILE  EQU 04H
+SD_CMD_WRITEFILE EQU 05H
+SD_CMD_CLOSEFILE EQU 06H
+SD_CMD_OPENDIR   EQU 08H
+SD_CMD_READDIR   EQU 09H
+
+SD_FA_READ       EQU 01H        ; FatFS access flag: open for reading
+SD_FA_WRITE      EQU 02H        ; FatFS access flag: open for writing
+SD_FA_CREATE_ALWAYS EQU 08H     ; FatFS create flag: always create / truncate existing
+
+FINFO_ATTR       EQU 8          ; FILINFO struct: byte offset of attribute field
+FINFO_NAME       EQU 9          ; FILINFO struct: byte offset of filename (null-terminated)
+FINFO_SIZE       EQU 32         ; FILINFO struct: total entry size (stride between READDIR results)
+SD_MATCH_LEN     EQU 13         ; max characters compared in wildcard pattern match
+SD_WILD_MAX      EQU 64         ; max length of SD wildcard path string (buffer size)
+
+FA_DIR           EQU 10H        ; FatFS attribute: entry is a directory (skip during copy)
+FA_VOL           EQU 08H        ; FatFS attribute: volume label (skip during copy)
+FA_HID           EQU 02H        ; FatFS attribute: hidden file (skip during copy)
+
+; DCB field offsets (from trsdos.h TRSDOS_FCB struct)
+DCB_TYPE    EQU     0           ; type: 0 = sequential (only mode we use)
+DCB_FLAGS   EQU     1           ; flags: bit 1 = read-only (checked before overwrite)
+DCB_BUF     EQU     3           ; buf:   16-bit pointer to I/O buffer
+DCB_DRIVE   EQU     6           ; drive number (0-7)
+DCB_DEC     EQU     7           ; DEC:   directory entry code (index into directory)
+DCB_EOF     EQU     8           ; EOF:   byte offset of last byte in final sector
+DCB_LRL     EQU     9           ; LRL:   logical record length (128 for sequential files)
+DCB_NRN     EQU     10          ; NRN:   next record number (16-bit, current read position)
+DCB_ERN     EQU     12          ; ERN:   ending record number (16-bit, last record in file)
+
+; Model I/III direct call addresses
+@DSPLY      EQU     4467H       ; display CR-terminated string (HL=string)
+@DSP        EQU     0033H       ; display single char (A=char)
+@PUT        EQU     001BH       ; put char to DCB (RST 24)
+DODCB$      EQU     401DH       ; *DO display DCB
+@PARAM      EQU     4454H       ; get command line parameters (returns HL=params)
+@FSPEC      EQU     441CH       ; parse file specification (HL=string, DE=DCB)
+@KILL       EQU     442CH       ; delete file by DCB (assumed address, unverified)
+@INIT       EQU     4420H       ; init/create file (DE=DCB)
+@OPEN       EQU     4424H       ; open existing file (DE=DCB)
+@CLOSE      EQU     4428H       ; close file (DE=DCB)
+@READ       EQU     4436H       ; read record (DE=DCB)
+@WRITE      EQU     4439H       ; write record (DE=DCB)
+@ERROR      EQU     4409H       ; display error (A=error code, Model I/III)
+@EXIT       EQU     402DH       ; exit to DOS
+@ABORT      EQU     4030H       ; abort to DOS
+
+; Model 4 SVC numbers (invoked via RST 40)
+@SVC        EQU     40          ; RST address for Model 4 SVCs
+@DSP6       EQU     2           ; display single char (C=char)
+@DSPLY6     EQU     10          ; display CR-terminated string (HL=string)
+@PARAM6     EQU     17          ; get command line parameters
+@FSPEC6     EQU     78          ; parse file specification
+@GTDCT6     EQU     81          ; get drive control table
+@DIRCYL6    EQU     84          ; NOTE: SVC 84 is NOT a public LS-DOS SVC -- @DIRCYL is kernel-internal only; do not call via RST 40
+@RDSSC6     EQU     85          ; read system sector
+@DIRRD6     EQU     87          ; read directory record
+@REMOV6     EQU     57          ; delete file by DCB (@@REMOV)
+@INIT6      EQU     58          ; init/create file
+@OPEN6      EQU     59          ; open existing file
+@CLOSE6     EQU     60          ; close file
+@READ6      EQU     67          ; read record
+@REW6       EQU     68          ; rewind file
+@WRITE6     EQU     75          ; write record
+@ERROR6     EQU     26          ; display error (C=error code, Model 4)
+@EXIT6      EQU     22          ; exit to DOS
+@ABORT6     EQU     21          ; abort to DOS
+
+DCB_SIZE    EQU     48          ; DCB workspace size (matches FreHD utility layout)
+SPEC_SIZE   EQU     80          ; file spec buffer size (large enough for SD: paths)
+WORK_SIZE   EQU     (DST_DCB + DCB_SIZE) - SRC_NAME  ; total size of all workspace from SRC_NAME to end of DST_DCB
+
+
+            ORG     5200H           ; load above DOS workspace; below 7000H high-res display memory
+
+; ----------------------------------------------------------------------
+; Model I/III jump table - active table, overwritten at startup if Model 4
+; Each entry must match the size of the corresponding Model 4 entry below
+; ----------------------------------------------------------------------
+
+STARTJ
+DSPLY       CALL    @DSPLY          ; 3
+            RET                     ; 1 = 4 bytes
+DSP         NOP                     ; 1
+            CALL    @DSP            ; 3
+            RET                     ; 1 = 5 bytes
+SETUP       LD      A,10H           ; 2
+            OUT     (0ECH),A        ; 2 (enable external I/O for NewDOS/80)
+            RET                     ; 1 = 5 bytes
+PARAM       CALL    @PARAM          ; 3
+            RET                     ; 1 = 4 bytes
+FSPEC       CALL    @FSPEC          ; 3
+            RET                     ; 1 = 4 bytes
+FOPEN       CALL    @OPEN           ; 3
+            RET                     ; 1 = 4 bytes
+FINIT       CALL    @INIT           ; 3
+            RET                     ; 1 = 4 bytes
+FCLOSE      CALL    @CLOSE          ; 3
+            RET                     ; 1 = 4 bytes
+FREAD       CALL    @READ           ; 3
+            RET                     ; 1 = 4 bytes
+FWRITE      CALL    @WRITE          ; 3
+            RET                     ; 1 = 4 bytes
+FERROR      CALL    @ERROR          ; 3 (A=error code on Model I/III)
+            RET                     ; 1 = 4 bytes
+FEXIT       CALL    @EXIT           ; 3
+            RET                     ; 1 = 4 bytes
+FABORT      CALL    @ABORT          ; 3
+            RET                     ; 1 = 4 bytes
+FREMOV      CALL    @KILL           ; 3 (assumed Model I/III address, unverified)
+            RET                     ; 1 = 4 bytes
+ENDJ
+
+; ----------------------------------------------------------------------
+; Model 4 jump table - copied over STARTJ when Model 4 is detected
+; Each entry must match the size of the corresponding Model I/III entry above
+; ----------------------------------------------------------------------
+
+STARTJ6
+DSPLY_6     LD      A,@DSPLY6       ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+DSP_6       LD      C,A             ; 1
+            LD      A,@DSP6         ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 5 bytes
+SETUP_6     NOP                     ; 1
+            NOP                     ; 1
+            NOP                     ; 1
+            NOP                     ; 1
+            RET                     ; 1 = 5 bytes
+PARAM_6     LD      A,@PARAM6       ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FSPEC_6     LD      A,@FSPEC6       ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FOPEN_6     LD      A,@OPEN6        ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FINIT_6     LD      A,@INIT6        ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FCLOSE_6    LD      A,@CLOSE6       ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FREAD_6     LD      A,@READ6        ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FWRITE_6    LD      A,@WRITE6       ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FERROR_6    LD      A,@ERROR6       ; 2 (C=error code on Model 4)
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FEXIT_6     LD      A,@EXIT6        ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FABORT_6    LD      A,@ABORT6       ; 2
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+FREMOV_6    LD      A,@REMOV6       ; 2 (@@REMOV SVC 57)
+            RST     @SVC            ; 1
+            RET                     ; 1 = 4 bytes
+ENDJ6
+
+            INCLUDE lppip_entry.inc
+            INCLUDE lppip_sd_paths.inc
+
+            INCLUDE lppip_dos_wild.inc
+
+            INCLUDE lppip_local.inc
+
+            INCLUDE lppip_errors.inc
+
+            INCLUDE lppip_helpers.inc
+
+            INCLUDE lppip_display.inc
+
+            INCLUDE lppip_exists.inc
+
+            INCLUDE lppip_frehd.inc
+
+            INCLUDE lppip_crc.inc
+
+            INCLUDE lppip_data.inc
+
+; ----------------------------------------------------------------------
+; Model identification (from FreHD reference source)
+; ----------------------------------------------------------------------
+
+            INCLUDE trsident.z80
+
+            END     LPPIP
